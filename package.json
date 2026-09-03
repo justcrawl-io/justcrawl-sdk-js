@@ -1,0 +1,62 @@
+{
+  "name": "@justcrawl/sdk",
+  "version": "0.1.0",
+  "description": "The official TypeScript SDK for the JustCrawl scraping orchestration API",
+  "license": "Apache-2.0",
+  "author": "JustCrawl",
+  "homepage": "https://docs.justcrawl.io",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/justcrawl-io/justcrawl-sdk-js.git"
+  },
+  "bugs": {
+    "url": "https://github.com/justcrawl-io/justcrawl-sdk-js/issues"
+  },
+  "keywords": [
+    "justcrawl",
+    "scraping",
+    "crawler",
+    "api",
+    "sdk",
+    "proxy",
+    "extraction"
+  ],
+  "type": "module",
+  "main": "./index.cjs",
+  "module": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js",
+      "require": "./index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "index.cjs",
+    "index.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {},
+  "engines": {
+    "node": ">=20.3.0"
+  },
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "tsx scripts/build.ts --out ."
+  },
+  "devDependencies": {
+    "@types/node": "26.4.0",
+    "dts-bundle-generator": "9.5.1",
+    "esbuild": "0.25.12",
+    "tsx": "4.21.0",
+    "typescript": "5.9.3"
+  }
+}

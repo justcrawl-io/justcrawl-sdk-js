@@ -1,0 +1,211 @@
+# Build and publish @justcrawl/sdk to npm with a provenance attestation.
+#
+# The BUILD happens here, in this workflow, and that is the point. This repo is a
+# source mirror, so npm's attestation says "npm built this tarball from this
+# commit of this repo" — a claim a reader can check against source they can read.
+# Until 2026-08-31 the mirror shipped prebuilt files and the attestation covered
+# only distribution: true, but far weaker than it looks, since nothing connected
+# those bytes to any inspectable source.
+#
+# This file is authored in the PRIVATE repo at
+# `libraries/sdk/sdk-js/.github/workflows/publish.yml` and mirrored to the public
+# repo's root by `tooling/scripts/mirror-sdk.sh` (KTD-8). Editing it there is
+# pointless — the next mirror force-push overwrites it. Edit it here.
+#
+# Why it is inside the mirror allowlist at all: leaving it outside means every
+# force-push deletes the release pipeline. That is a bug, not a safety measure.
+#
+# The obvious objection — "this hands npm-publish authority to anyone who can
+# merge to GitLab main" — is answered at the CREDENTIAL, not at the file:
+# NPM_TOKEN lives in a GitHub Environment with required reviewers, so a human
+# approves every publish. Editing this workflow is therefore not equivalent to
+# publishing.
+name: publish
+
+on:
+  push:
+    tags:
+      # The mirror script pushes `sdk-vX.Y.Z` alongside the squashed commit.
+      - 'sdk-v*'
+  # Manual re-run for a tag whose publish failed after approval. Never a way to
+  # publish an arbitrary ref: the job still reads the version from the tree and
+  # npm still refuses to overwrite a published version.
+  workflow_dispatch:
+
+# Least privilege at the top; the publish job widens only what it needs.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    # Runs WITHOUT any access to NPM_TOKEN — no environment, no id-token. A
+    # malformed tree fails here, before the credential is ever in scope.
+    runs-on: ubuntu-latest
+    steps:
+      # Third-party actions are pinned by full commit SHA, never by tag: a tag is
+      # mutable and a compromised action would run with the publish job's rights
+      # one step later.
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Node
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install and build
+        # Exactly what the publish job below runs, so a build that cannot succeed
+        # fails HERE — before NPM_TOKEN is in scope and before a human is asked to
+        # approve anything.
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund --ignore-scripts
+          npm run build
+
+      - name: Assert the tag matches the manifest version
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#sdk-v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "tag $GITHUB_REF_NAME implies $TAG_VERSION but package.json says $PKG_VERSION" >&2
+            exit 1
+          fi
+          echo "publishing version $PKG_VERSION"
+
+      - name: Assert the artifact is dependency-free and correctly named
+        run: |
+          set -euo pipefail
+          node -e '
+            const pkg = require("./package.json");
+            const fail = (m) => { console.error(m); process.exit(1); };
+            if (pkg.name !== "@justcrawl/sdk") fail(`wrong name: ${pkg.name}`);
+            if (pkg.license !== "Apache-2.0") fail(`wrong license: ${pkg.license}`);
+            if (Object.keys(pkg.dependencies ?? {}).length > 0) fail("published artifact must have no dependencies");
+            if (pkg.private) fail("private: true would make the publish fail anyway");
+            console.log("manifest ok");
+          '
+
+      - name: Assert the build produced every file the manifest ships
+        # `files` is the contract with npm; a build that silently skipped an
+        # output would publish a tarball missing its own entry point.
+        run: |
+          set -euo pipefail
+          node -e '
+            const { existsSync } = require("fs");
+            const missing = require("./package.json").files.filter((f) => !existsSync(f));
+            if (missing.length > 0) { console.error(`missing: ${missing.join(", ")}`); process.exit(1); }
+            console.log("all published files present");
+          '
+
+      - name: Assert no private package specifier survived the bundle
+        # The KTD-4 failure mode, checked one last time at the boundary: a bare
+        # `@scraperoute/*` specifier would 404 on install or break every
+        # TypeScript consumer with TS2307.
+        run: |
+          set -euo pipefail
+          if grep -nE "(from|require\(|import\()[[:space:]]*['\"]@scraperoute/" index.js index.cjs index.d.ts; then
+            echo "found a private package specifier in the published files" >&2
+            exit 1
+          fi
+          echo "no private specifiers"
+
+      - name: Pack and show exactly what would ship
+        run: npm pack --dry-run
+
+  publish:
+    needs: [verify]
+    runs-on: ubuntu-latest
+    # The human gate. NPM_TOKEN lives here, and GitHub blocks the job until a
+    # required reviewer approves — which is what makes "who can edit the
+    # workflow" a different question from "who can publish".
+    environment: npm-publish
+    permissions:
+      contents: read
+      # Only here, and only on this job: the OIDC token npm exchanges for the
+      # provenance attestation.
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Node
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install and build
+        # Rebuilt rather than carried over from `verify` as an artifact: the
+        # attestation must cover what THIS job produced. Passing a tarball between
+        # jobs would put an unattested hop in the middle of the chain provenance
+        # exists to close.
+        #
+        # That rebuild is exactly why the assertions below repeat `verify`'s
+        # rather than trusting them. `needs: [verify]` orders the jobs; it does
+        # not make verify's checks apply to THIS job's independently resolved
+        # install. Whatever this step produces is what npm irreversibly
+        # publishes, so it is what has to be checked.
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund --ignore-scripts
+          npm run build
+
+      - name: Assert the tag matches the manifest version
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#sdk-v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "tag $GITHUB_REF_NAME implies $TAG_VERSION but package.json says $PKG_VERSION" >&2
+            exit 1
+          fi
+          echo "publishing version $PKG_VERSION"
+
+      - name: Assert the artifact is dependency-free and correctly named
+        run: |
+          set -euo pipefail
+          node -e '
+            const pkg = require("./package.json");
+            const fail = (m) => { console.error(m); process.exit(1); };
+            if (pkg.name !== "@justcrawl/sdk") fail(`wrong name: ${pkg.name}`);
+            if (pkg.license !== "Apache-2.0") fail(`wrong license: ${pkg.license}`);
+            if (Object.keys(pkg.dependencies ?? {}).length > 0) fail("published artifact must have no dependencies");
+            if (pkg.private) fail("private: true would make the publish fail anyway");
+            console.log("manifest ok");
+          '
+
+      - name: Assert the build produced every file the manifest ships
+        # `files` is the contract with npm; a build that silently skipped an
+        # output would publish a tarball missing its own entry point.
+        run: |
+          set -euo pipefail
+          node -e '
+            const { existsSync } = require("fs");
+            const missing = require("./package.json").files.filter((f) => !existsSync(f));
+            if (missing.length > 0) { console.error(`missing: ${missing.join(", ")}`); process.exit(1); }
+            console.log("all published files present");
+          '
+
+      - name: Assert no private package specifier survived the bundle
+        # The KTD-4 failure mode, checked one last time at the boundary: a bare
+        # `@scraperoute/*` specifier would 404 on install or break every
+        # TypeScript consumer with TS2307.
+        run: |
+          set -euo pipefail
+          if grep -nE "(from|require\(|import\()[[:space:]]*['\"]@scraperoute/" index.js index.cjs index.d.ts; then
+            echo "found a private package specifier in the published files" >&2
+            exit 1
+          fi
+          echo "no private specifiers"
+
+      - name: Publish with provenance
+        # `--provenance` requires this repo to be public and the workflow to run
+        # on GitHub Actions — which is the entire reason the mirror exists.
+        # Self-hosted GitLab cannot issue a provenance attestation (KTD-6).
+        # Because the build ran in the step above, the attestation binds the
+        # tarball to this repo's SOURCE, not merely to files someone committed.
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
